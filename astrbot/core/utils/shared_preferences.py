@@ -1,7 +1,10 @@
 import asyncio
 import os
 import threading
+from collections import defaultdict
 from typing import Any, TypeVar, overload
+
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from astrbot.core.db import BaseDatabase
 from astrbot.core.db.po import Preference
@@ -20,10 +23,21 @@ class SharedPreferences:
             )
         self.path = json_storage_path
         self.db_helper = db_helper
+        self.temorary_cache: dict[str, dict[str, Any]] = defaultdict(dict)
+        """automatically clear per 24 hours. Might be helpful in some cases XD"""
 
         self._sync_loop = asyncio.new_event_loop()
         t = threading.Thread(target=self._sync_loop.run_forever, daemon=True)
         t.start()
+
+        self._scheduler = BackgroundScheduler()
+        self._scheduler.add_job(
+            self._clear_temporary_cache, "interval", hours=24, id="clear_sp_temp_cache"
+        )
+        self._scheduler.start()
+
+    def _clear_temporary_cache(self):
+        self.temorary_cache.clear()
 
     async def get_async(
         self,
@@ -40,9 +54,6 @@ class SharedPreferences:
             else:
                 ret = default
             return ret
-        raise ValueError(
-            "scope_id and key cannot be None when getting a specific preference.",
-        )
 
     async def range_get_async(
         self,
@@ -55,6 +66,14 @@ class SharedPreferences:
         """
         ret = await self.db_helper.get_preferences(scope, scope_id, key)
         return ret
+
+    @overload
+    async def session_get(
+        self,
+        umo: str,
+        key: str,
+        default: _VT = None,
+    ) -> _VT: ...
 
     @overload
     async def session_get(
@@ -88,7 +107,7 @@ class SharedPreferences:
     ) -> _VT | list[Preference]:
         """获取会话范围的偏好设置
 
-        Note: 当 scope_id 或者 key 为 None，时，返回 Preference 列表，其中的 value 属性是一个 dict，value["val"] 为值。
+        Note: 当 umo 或者 key 为 None，时，返回 Preference 列表，其中的 value 属性是一个 dict，value["val"] 为值。
         """
         if umo is None or key is None:
             return await self.range_get_async("umo", umo, key)

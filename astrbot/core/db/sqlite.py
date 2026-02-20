@@ -1,19 +1,27 @@
 import asyncio
 import threading
 import typing as T
-from datetime import datetime, timedelta
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col, delete, desc, func, or_, select, text, update
 
 from astrbot.core.db import BaseDatabase
 from astrbot.core.db.po import (
     Attachment,
+    ChatUIProject,
+    CommandConfig,
+    CommandConflict,
     ConversationV2,
     Persona,
+    PersonaFolder,
     PlatformMessageHistory,
+    PlatformSession,
     PlatformStat,
     Preference,
+    SessionProjectRelation,
     SQLModel,
 )
 from astrbot.core.db.po import (
@@ -24,6 +32,7 @@ from astrbot.core.db.po import (
 )
 
 NOT_GIVEN = T.TypeVar("NOT_GIVEN")
+TxResult = T.TypeVar("TxResult")
 
 
 class SQLiteDatabase(BaseDatabase):
@@ -43,7 +52,29 @@ class SQLiteDatabase(BaseDatabase):
             await conn.execute(text("PRAGMA temp_store=MEMORY"))
             await conn.execute(text("PRAGMA mmap_size=134217728"))
             await conn.execute(text("PRAGMA optimize"))
+            # 确保 personas 表有 folder_id 和 sort_order 列（前向兼容）
+            await self._ensure_persona_folder_columns(conn)
             await conn.commit()
+
+    async def _ensure_persona_folder_columns(self, conn) -> None:
+        """确保 personas 表有 folder_id 和 sort_order 列。
+
+        这是为了支持旧版数据库的平滑升级。新版数据库通过 SQLModel
+        的 metadata.create_all 自动创建这些列。
+        """
+        result = await conn.execute(text("PRAGMA table_info(personas)"))
+        columns = {row[1] for row in result.fetchall()}
+
+        if "folder_id" not in columns:
+            await conn.execute(
+                text(
+                    "ALTER TABLE personas ADD COLUMN folder_id VARCHAR(36) DEFAULT NULL"
+                )
+            )
+        if "sort_order" not in columns:
+            await conn.execute(
+                text("ALTER TABLE personas ADD COLUMN sort_order INTEGER DEFAULT 0")
+            )
 
     # ====
     # Platform Statistics
@@ -104,8 +135,8 @@ class SQLiteDatabase(BaseDatabase):
                 text("""
                 SELECT * FROM platform_stats
                 WHERE timestamp >= :start_time
-                ORDER BY timestamp DESC
                 GROUP BY platform_id
+                ORDER BY timestamp DESC
                 """),
                 {"start_time": start_time},
             )
@@ -235,7 +266,9 @@ class SQLiteDatabase(BaseDatabase):
                 session.add(new_conversation)
                 return new_conversation
 
-    async def update_conversation(self, cid, title=None, persona_id=None, content=None):
+    async def update_conversation(
+        self, cid, title=None, persona_id=None, content=None, token_usage=None
+    ):
         async with self.get_db() as session:
             session: AsyncSession
             async with session.begin():
@@ -249,6 +282,8 @@ class SQLiteDatabase(BaseDatabase):
                     values["persona_id"] = persona_id
                 if content is not None:
                     values["content"] = content
+                if token_usage is not None:
+                    values["token_usage"] = token_usage
                 if not values:
                     return None
                 query = query.values(**values)
@@ -412,7 +447,7 @@ class SQLiteDatabase(BaseDatabase):
         user_id,
         offset_sec=86400,
     ):
-        """Delete platform message history records older than the specified offset."""
+        """Delete platform message history records newer than the specified offset."""
         async with self.get_db() as session:
             session: AsyncSession
             async with session.begin():
@@ -422,7 +457,7 @@ class SQLiteDatabase(BaseDatabase):
                     delete(PlatformMessageHistory).where(
                         col(PlatformMessageHistory.platform_id) == platform_id,
                         col(PlatformMessageHistory.user_id) == user_id,
-                        col(PlatformMessageHistory.created_at) < cutoff_time,
+                        col(PlatformMessageHistory.created_at) >= cutoff_time,
                     ),
                 )
 
@@ -448,6 +483,18 @@ class SQLiteDatabase(BaseDatabase):
             result = await session.execute(query.offset(offset).limit(page_size))
             return result.scalars().all()
 
+    async def get_platform_message_history_by_id(
+        self, message_id: int
+    ) -> PlatformMessageHistory | None:
+        """Get a platform message history record by its ID."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            query = select(PlatformMessageHistory).where(
+                PlatformMessageHistory.id == message_id
+            )
+            result = await session.execute(query)
+            return result.scalar_one_or_none()
+
     async def insert_attachment(self, path, type, mime_type):
         """Insert a new attachment record."""
         async with self.get_db() as session:
@@ -469,12 +516,56 @@ class SQLiteDatabase(BaseDatabase):
             result = await session.execute(query)
             return result.scalar_one_or_none()
 
+    async def get_attachments(self, attachment_ids: list[str]) -> list:
+        """Get multiple attachments by their IDs."""
+        if not attachment_ids:
+            return []
+        async with self.get_db() as session:
+            session: AsyncSession
+            query = select(Attachment).where(
+                col(Attachment.attachment_id).in_(attachment_ids)
+            )
+            result = await session.execute(query)
+            return list(result.scalars().all())
+
+    async def delete_attachment(self, attachment_id: str) -> bool:
+        """Delete an attachment by its ID.
+
+        Returns True if the attachment was deleted, False if it was not found.
+        """
+        async with self.get_db() as session:
+            session: AsyncSession
+            async with session.begin():
+                query = delete(Attachment).where(
+                    col(Attachment.attachment_id) == attachment_id
+                )
+                result = T.cast(CursorResult, await session.execute(query))
+                return result.rowcount > 0
+
+    async def delete_attachments(self, attachment_ids: list[str]) -> int:
+        """Delete multiple attachments by their IDs.
+
+        Returns the number of attachments deleted.
+        """
+        if not attachment_ids:
+            return 0
+        async with self.get_db() as session:
+            session: AsyncSession
+            async with session.begin():
+                query = delete(Attachment).where(
+                    col(Attachment.attachment_id).in_(attachment_ids)
+                )
+                result = T.cast(CursorResult, await session.execute(query))
+                return result.rowcount
+
     async def insert_persona(
         self,
         persona_id,
         system_prompt,
         begin_dialogs=None,
         tools=None,
+        folder_id=None,
+        sort_order=0,
     ):
         """Insert a new persona record."""
         async with self.get_db() as session:
@@ -485,8 +576,12 @@ class SQLiteDatabase(BaseDatabase):
                     system_prompt=system_prompt,
                     begin_dialogs=begin_dialogs or [],
                     tools=tools,
+                    folder_id=folder_id,
+                    sort_order=sort_order,
                 )
                 session.add(new_persona)
+                await session.flush()
+                await session.refresh(new_persona)
                 return new_persona
 
     async def get_persona_by_id(self, persona_id):
@@ -538,6 +633,207 @@ class SQLiteDatabase(BaseDatabase):
                 await session.execute(
                     delete(Persona).where(col(Persona.persona_id) == persona_id),
                 )
+
+    # ====
+    # Persona Folder Management
+    # ====
+
+    async def insert_persona_folder(
+        self,
+        name: str,
+        parent_id: str | None = None,
+        description: str | None = None,
+        sort_order: int = 0,
+    ) -> PersonaFolder:
+        """Insert a new persona folder."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            async with session.begin():
+                new_folder = PersonaFolder(
+                    name=name,
+                    parent_id=parent_id,
+                    description=description,
+                    sort_order=sort_order,
+                )
+                session.add(new_folder)
+                await session.flush()
+                await session.refresh(new_folder)
+                return new_folder
+
+    async def get_persona_folder_by_id(self, folder_id: str) -> PersonaFolder | None:
+        """Get a persona folder by its folder_id."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            query = select(PersonaFolder).where(PersonaFolder.folder_id == folder_id)
+            result = await session.execute(query)
+            return result.scalar_one_or_none()
+
+    async def get_persona_folders(
+        self, parent_id: str | None = None
+    ) -> list[PersonaFolder]:
+        """Get all persona folders, optionally filtered by parent_id.
+
+        Args:
+            parent_id: If None, returns root folders only. If specified, returns
+                       children of that folder.
+        """
+        async with self.get_db() as session:
+            session: AsyncSession
+            if parent_id is None:
+                # Get root folders (parent_id is NULL)
+                query = (
+                    select(PersonaFolder)
+                    .where(col(PersonaFolder.parent_id).is_(None))
+                    .order_by(col(PersonaFolder.sort_order), col(PersonaFolder.name))
+                )
+            else:
+                query = (
+                    select(PersonaFolder)
+                    .where(PersonaFolder.parent_id == parent_id)
+                    .order_by(col(PersonaFolder.sort_order), col(PersonaFolder.name))
+                )
+            result = await session.execute(query)
+            return list(result.scalars().all())
+
+    async def get_all_persona_folders(self) -> list[PersonaFolder]:
+        """Get all persona folders."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            query = select(PersonaFolder).order_by(
+                col(PersonaFolder.sort_order), col(PersonaFolder.name)
+            )
+            result = await session.execute(query)
+            return list(result.scalars().all())
+
+    async def update_persona_folder(
+        self,
+        folder_id: str,
+        name: str | None = None,
+        parent_id: T.Any = NOT_GIVEN,
+        description: T.Any = NOT_GIVEN,
+        sort_order: int | None = None,
+    ) -> PersonaFolder | None:
+        """Update a persona folder."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            async with session.begin():
+                query = update(PersonaFolder).where(
+                    col(PersonaFolder.folder_id) == folder_id
+                )
+                values: dict[str, T.Any] = {}
+                if name is not None:
+                    values["name"] = name
+                if parent_id is not NOT_GIVEN:
+                    values["parent_id"] = parent_id
+                if description is not NOT_GIVEN:
+                    values["description"] = description
+                if sort_order is not None:
+                    values["sort_order"] = sort_order
+                if not values:
+                    return None
+                query = query.values(**values)
+                await session.execute(query)
+        return await self.get_persona_folder_by_id(folder_id)
+
+    async def delete_persona_folder(self, folder_id: str) -> None:
+        """Delete a persona folder by its folder_id.
+
+        Note: This will also set folder_id to NULL for all personas in this folder,
+        moving them to the root directory.
+        """
+        async with self.get_db() as session:
+            session: AsyncSession
+            async with session.begin():
+                # Move personas to root directory
+                await session.execute(
+                    update(Persona)
+                    .where(col(Persona.folder_id) == folder_id)
+                    .values(folder_id=None)
+                )
+                # Delete the folder
+                await session.execute(
+                    delete(PersonaFolder).where(
+                        col(PersonaFolder.folder_id) == folder_id
+                    ),
+                )
+
+    async def move_persona_to_folder(
+        self, persona_id: str, folder_id: str | None
+    ) -> Persona | None:
+        """Move a persona to a folder (or root if folder_id is None)."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            async with session.begin():
+                await session.execute(
+                    update(Persona)
+                    .where(col(Persona.persona_id) == persona_id)
+                    .values(folder_id=folder_id)
+                )
+        return await self.get_persona_by_id(persona_id)
+
+    async def get_personas_by_folder(
+        self, folder_id: str | None = None
+    ) -> list[Persona]:
+        """Get all personas in a specific folder.
+
+        Args:
+            folder_id: If None, returns personas in root directory.
+        """
+        async with self.get_db() as session:
+            session: AsyncSession
+            if folder_id is None:
+                query = (
+                    select(Persona)
+                    .where(col(Persona.folder_id).is_(None))
+                    .order_by(col(Persona.sort_order), col(Persona.persona_id))
+                )
+            else:
+                query = (
+                    select(Persona)
+                    .where(Persona.folder_id == folder_id)
+                    .order_by(col(Persona.sort_order), col(Persona.persona_id))
+                )
+            result = await session.execute(query)
+            return list(result.scalars().all())
+
+    async def batch_update_sort_order(
+        self,
+        items: list[dict],
+    ) -> None:
+        """Batch update sort_order for personas and/or folders.
+
+        Args:
+            items: List of dicts with keys:
+                - id: The persona_id or folder_id
+                - type: Either "persona" or "folder"
+                - sort_order: The new sort_order value
+        """
+        if not items:
+            return
+
+        async with self.get_db() as session:
+            session: AsyncSession
+            async with session.begin():
+                for item in items:
+                    item_id = item.get("id")
+                    item_type = item.get("type")
+                    sort_order = item.get("sort_order")
+
+                    if item_id is None or item_type is None or sort_order is None:
+                        continue
+
+                    if item_type == "persona":
+                        await session.execute(
+                            update(Persona)
+                            .where(col(Persona.persona_id) == item_id)
+                            .values(sort_order=sort_order)
+                        )
+                    elif item_type == "folder":
+                        await session.execute(
+                            update(PersonaFolder)
+                            .where(col(PersonaFolder.folder_id) == item_id)
+                            .values(sort_order=sort_order)
+                        )
 
     async def insert_preference_or_update(self, scope, scope_id, key, value):
         """Insert a new preference record or update if it exists."""
@@ -613,6 +909,242 @@ class SQLiteDatabase(BaseDatabase):
                     ),
                 )
             await session.commit()
+
+    # ====
+    # Command Configuration & Conflict Tracking
+    # ====
+
+    async def _run_in_tx(
+        self,
+        fn: Callable[[AsyncSession], Awaitable[TxResult]],
+    ) -> TxResult:
+        async with self.get_db() as session:
+            session: AsyncSession
+            async with session.begin():
+                return await fn(session)
+
+    @staticmethod
+    def _apply_updates(model, **updates) -> None:
+        for field, value in updates.items():
+            if value is not None:
+                setattr(model, field, value)
+
+    @staticmethod
+    def _new_command_config(
+        handler_full_name: str,
+        plugin_name: str,
+        module_path: str,
+        original_command: str,
+        *,
+        resolved_command: str | None = None,
+        enabled: bool | None = None,
+        keep_original_alias: bool | None = None,
+        conflict_key: str | None = None,
+        resolution_strategy: str | None = None,
+        note: str | None = None,
+        extra_data: dict | None = None,
+        auto_managed: bool | None = None,
+    ) -> CommandConfig:
+        return CommandConfig(
+            handler_full_name=handler_full_name,
+            plugin_name=plugin_name,
+            module_path=module_path,
+            original_command=original_command,
+            resolved_command=resolved_command,
+            enabled=True if enabled is None else enabled,
+            keep_original_alias=False
+            if keep_original_alias is None
+            else keep_original_alias,
+            conflict_key=conflict_key or original_command,
+            resolution_strategy=resolution_strategy,
+            note=note,
+            extra_data=extra_data,
+            auto_managed=bool(auto_managed),
+        )
+
+    @staticmethod
+    def _new_command_conflict(
+        conflict_key: str,
+        handler_full_name: str,
+        plugin_name: str,
+        *,
+        status: str | None = None,
+        resolution: str | None = None,
+        resolved_command: str | None = None,
+        note: str | None = None,
+        extra_data: dict | None = None,
+        auto_generated: bool | None = None,
+    ) -> CommandConflict:
+        return CommandConflict(
+            conflict_key=conflict_key,
+            handler_full_name=handler_full_name,
+            plugin_name=plugin_name,
+            status=status or "pending",
+            resolution=resolution,
+            resolved_command=resolved_command,
+            note=note,
+            extra_data=extra_data,
+            auto_generated=bool(auto_generated),
+        )
+
+    async def get_command_configs(self) -> list[CommandConfig]:
+        async with self.get_db() as session:
+            session: AsyncSession
+            result = await session.execute(select(CommandConfig))
+            return list(result.scalars().all())
+
+    async def get_command_config(
+        self,
+        handler_full_name: str,
+    ) -> CommandConfig | None:
+        async with self.get_db() as session:
+            session: AsyncSession
+            return await session.get(CommandConfig, handler_full_name)
+
+    async def upsert_command_config(
+        self,
+        handler_full_name: str,
+        plugin_name: str,
+        module_path: str,
+        original_command: str,
+        *,
+        resolved_command: str | None = None,
+        enabled: bool | None = None,
+        keep_original_alias: bool | None = None,
+        conflict_key: str | None = None,
+        resolution_strategy: str | None = None,
+        note: str | None = None,
+        extra_data: dict | None = None,
+        auto_managed: bool | None = None,
+    ) -> CommandConfig:
+        async def _op(session: AsyncSession) -> CommandConfig:
+            config = await session.get(CommandConfig, handler_full_name)
+            if not config:
+                config = self._new_command_config(
+                    handler_full_name,
+                    plugin_name,
+                    module_path,
+                    original_command,
+                    resolved_command=resolved_command,
+                    enabled=enabled,
+                    keep_original_alias=keep_original_alias,
+                    conflict_key=conflict_key,
+                    resolution_strategy=resolution_strategy,
+                    note=note,
+                    extra_data=extra_data,
+                    auto_managed=auto_managed,
+                )
+                session.add(config)
+            else:
+                self._apply_updates(
+                    config,
+                    plugin_name=plugin_name,
+                    module_path=module_path,
+                    original_command=original_command,
+                    resolved_command=resolved_command,
+                    enabled=enabled,
+                    keep_original_alias=keep_original_alias,
+                    conflict_key=conflict_key,
+                    resolution_strategy=resolution_strategy,
+                    note=note,
+                    extra_data=extra_data,
+                    auto_managed=auto_managed,
+                )
+            await session.flush()
+            await session.refresh(config)
+            return config
+
+        return await self._run_in_tx(_op)
+
+    async def delete_command_config(self, handler_full_name: str) -> None:
+        await self.delete_command_configs([handler_full_name])
+
+    async def delete_command_configs(self, handler_full_names: list[str]) -> None:
+        if not handler_full_names:
+            return
+
+        async def _op(session: AsyncSession) -> None:
+            await session.execute(
+                delete(CommandConfig).where(
+                    col(CommandConfig.handler_full_name).in_(handler_full_names),
+                ),
+            )
+
+        await self._run_in_tx(_op)
+
+    async def list_command_conflicts(
+        self,
+        status: str | None = None,
+    ) -> list[CommandConflict]:
+        async with self.get_db() as session:
+            session: AsyncSession
+            query = select(CommandConflict)
+            if status:
+                query = query.where(CommandConflict.status == status)
+            result = await session.execute(query)
+            return list(result.scalars().all())
+
+    async def upsert_command_conflict(
+        self,
+        conflict_key: str,
+        handler_full_name: str,
+        plugin_name: str,
+        *,
+        status: str | None = None,
+        resolution: str | None = None,
+        resolved_command: str | None = None,
+        note: str | None = None,
+        extra_data: dict | None = None,
+        auto_generated: bool | None = None,
+    ) -> CommandConflict:
+        async def _op(session: AsyncSession) -> CommandConflict:
+            result = await session.execute(
+                select(CommandConflict).where(
+                    CommandConflict.conflict_key == conflict_key,
+                    CommandConflict.handler_full_name == handler_full_name,
+                ),
+            )
+            record = result.scalar_one_or_none()
+            if not record:
+                record = self._new_command_conflict(
+                    conflict_key,
+                    handler_full_name,
+                    plugin_name,
+                    status=status,
+                    resolution=resolution,
+                    resolved_command=resolved_command,
+                    note=note,
+                    extra_data=extra_data,
+                    auto_generated=auto_generated,
+                )
+                session.add(record)
+            else:
+                self._apply_updates(
+                    record,
+                    plugin_name=plugin_name,
+                    status=status,
+                    resolution=resolution,
+                    resolved_command=resolved_command,
+                    note=note,
+                    extra_data=extra_data,
+                    auto_generated=auto_generated,
+                )
+            await session.flush()
+            await session.refresh(record)
+            return record
+
+        return await self._run_in_tx(_op)
+
+    async def delete_command_conflicts(self, ids: list[int]) -> None:
+        if not ids:
+            return
+
+        async def _op(session: AsyncSession) -> None:
+            await session.execute(
+                delete(CommandConflict).where(col(CommandConflict.id).in_(ids)),
+            )
+
+        await self._run_in_tx(_op)
 
     # ====
     # Deprecated Methods
@@ -709,3 +1241,320 @@ class SQLiteDatabase(BaseDatabase):
         t.start()
         t.join()
         return result
+
+    # ====
+    # Platform Session Management
+    # ====
+
+    async def create_platform_session(
+        self,
+        creator: str,
+        platform_id: str = "webchat",
+        session_id: str | None = None,
+        display_name: str | None = None,
+        is_group: int = 0,
+    ) -> PlatformSession:
+        """Create a new Platform session."""
+        kwargs = {}
+        if session_id:
+            kwargs["session_id"] = session_id
+
+        async with self.get_db() as session:
+            session: AsyncSession
+            async with session.begin():
+                new_session = PlatformSession(
+                    creator=creator,
+                    platform_id=platform_id,
+                    display_name=display_name,
+                    is_group=is_group,
+                    **kwargs,
+                )
+                session.add(new_session)
+                await session.flush()
+                await session.refresh(new_session)
+                return new_session
+
+    async def get_platform_session_by_id(
+        self, session_id: str
+    ) -> PlatformSession | None:
+        """Get a Platform session by its ID."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            query = select(PlatformSession).where(
+                PlatformSession.session_id == session_id,
+            )
+            result = await session.execute(query)
+            return result.scalar_one_or_none()
+
+    async def get_platform_sessions_by_creator(
+        self,
+        creator: str,
+        platform_id: str | None = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> list[dict]:
+        """Get all Platform sessions for a specific creator (username) and optionally platform.
+
+        Returns a list of dicts containing session info and project info (if session belongs to a project).
+        """
+        async with self.get_db() as session:
+            session: AsyncSession
+            offset = (page - 1) * page_size
+
+            # LEFT JOIN with SessionProjectRelation and ChatUIProject to get project info
+            query = (
+                select(
+                    PlatformSession,
+                    col(ChatUIProject.project_id),
+                    col(ChatUIProject.title).label("project_title"),
+                    col(ChatUIProject.emoji).label("project_emoji"),
+                )
+                .outerjoin(
+                    SessionProjectRelation,
+                    col(PlatformSession.session_id)
+                    == col(SessionProjectRelation.session_id),
+                )
+                .outerjoin(
+                    ChatUIProject,
+                    col(SessionProjectRelation.project_id)
+                    == col(ChatUIProject.project_id),
+                )
+                .where(col(PlatformSession.creator) == creator)
+            )
+
+            if platform_id:
+                query = query.where(PlatformSession.platform_id == platform_id)
+
+            query = (
+                query.order_by(desc(PlatformSession.updated_at))
+                .offset(offset)
+                .limit(page_size)
+            )
+            result = await session.execute(query)
+
+            # Convert to list of dicts with session and project info
+            sessions_with_projects = []
+            for row in result.all():
+                platform_session = row[0]
+                project_id = row[1]
+                project_title = row[2]
+                project_emoji = row[3]
+
+                session_dict = {
+                    "session": platform_session,
+                    "project_id": project_id,
+                    "project_title": project_title,
+                    "project_emoji": project_emoji,
+                }
+                sessions_with_projects.append(session_dict)
+
+            return sessions_with_projects
+
+    async def update_platform_session(
+        self,
+        session_id: str,
+        display_name: str | None = None,
+    ) -> None:
+        """Update a Platform session's updated_at timestamp and optionally display_name."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            async with session.begin():
+                values: dict[str, T.Any] = {"updated_at": datetime.now(timezone.utc)}
+                if display_name is not None:
+                    values["display_name"] = display_name
+
+                await session.execute(
+                    update(PlatformSession)
+                    .where(col(PlatformSession.session_id) == session_id)
+                    .values(**values),
+                )
+
+    async def delete_platform_session(self, session_id: str) -> None:
+        """Delete a Platform session by its ID."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            async with session.begin():
+                await session.execute(
+                    delete(PlatformSession).where(
+                        col(PlatformSession.session_id) == session_id,
+                    ),
+                )
+
+    # ====
+    # ChatUI Project Management
+    # ====
+
+    async def create_chatui_project(
+        self,
+        creator: str,
+        title: str,
+        emoji: str | None = "📁",
+        description: str | None = None,
+    ) -> ChatUIProject:
+        """Create a new ChatUI project."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            async with session.begin():
+                project = ChatUIProject(
+                    creator=creator,
+                    title=title,
+                    emoji=emoji,
+                    description=description,
+                )
+                session.add(project)
+                await session.flush()
+                await session.refresh(project)
+                return project
+
+    async def get_chatui_project_by_id(self, project_id: str) -> ChatUIProject | None:
+        """Get a ChatUI project by its ID."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            result = await session.execute(
+                select(ChatUIProject).where(
+                    col(ChatUIProject.project_id) == project_id,
+                ),
+            )
+            return result.scalar_one_or_none()
+
+    async def get_chatui_projects_by_creator(
+        self,
+        creator: str,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> list[ChatUIProject]:
+        """Get all ChatUI projects for a specific creator."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            offset = (page - 1) * page_size
+            result = await session.execute(
+                select(ChatUIProject)
+                .where(col(ChatUIProject.creator) == creator)
+                .order_by(desc(ChatUIProject.updated_at))
+                .limit(page_size)
+                .offset(offset),
+            )
+            return list(result.scalars().all())
+
+    async def update_chatui_project(
+        self,
+        project_id: str,
+        title: str | None = None,
+        emoji: str | None = None,
+        description: str | None = None,
+    ) -> None:
+        """Update a ChatUI project."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            async with session.begin():
+                values: dict[str, T.Any] = {"updated_at": datetime.now(timezone.utc)}
+                if title is not None:
+                    values["title"] = title
+                if emoji is not None:
+                    values["emoji"] = emoji
+                if description is not None:
+                    values["description"] = description
+
+                await session.execute(
+                    update(ChatUIProject)
+                    .where(col(ChatUIProject.project_id) == project_id)
+                    .values(**values),
+                )
+
+    async def delete_chatui_project(self, project_id: str) -> None:
+        """Delete a ChatUI project by its ID."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            async with session.begin():
+                # First remove all session relations
+                await session.execute(
+                    delete(SessionProjectRelation).where(
+                        col(SessionProjectRelation.project_id) == project_id,
+                    ),
+                )
+                # Then delete the project
+                await session.execute(
+                    delete(ChatUIProject).where(
+                        col(ChatUIProject.project_id) == project_id,
+                    ),
+                )
+
+    async def add_session_to_project(
+        self,
+        session_id: str,
+        project_id: str,
+    ) -> SessionProjectRelation:
+        """Add a session to a project."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            async with session.begin():
+                # First remove existing relation if any
+                await session.execute(
+                    delete(SessionProjectRelation).where(
+                        col(SessionProjectRelation.session_id) == session_id,
+                    ),
+                )
+                # Then create new relation
+                relation = SessionProjectRelation(
+                    session_id=session_id,
+                    project_id=project_id,
+                )
+                session.add(relation)
+                await session.flush()
+                await session.refresh(relation)
+                return relation
+
+    async def remove_session_from_project(self, session_id: str) -> None:
+        """Remove a session from its project."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            async with session.begin():
+                await session.execute(
+                    delete(SessionProjectRelation).where(
+                        col(SessionProjectRelation.session_id) == session_id,
+                    ),
+                )
+
+    async def get_project_sessions(
+        self,
+        project_id: str,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> list[PlatformSession]:
+        """Get all sessions in a project."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            offset = (page - 1) * page_size
+            result = await session.execute(
+                select(PlatformSession)
+                .join(
+                    SessionProjectRelation,
+                    col(PlatformSession.session_id)
+                    == col(SessionProjectRelation.session_id),
+                )
+                .where(col(SessionProjectRelation.project_id) == project_id)
+                .order_by(desc(PlatformSession.updated_at))
+                .limit(page_size)
+                .offset(offset),
+            )
+            return list(result.scalars().all())
+
+    async def get_project_by_session(
+        self, session_id: str, creator: str
+    ) -> ChatUIProject | None:
+        """Get the project that a session belongs to."""
+        async with self.get_db() as session:
+            session: AsyncSession
+            result = await session.execute(
+                select(ChatUIProject)
+                .join(
+                    SessionProjectRelation,
+                    col(ChatUIProject.project_id)
+                    == col(SessionProjectRelation.project_id),
+                )
+                .where(
+                    col(SessionProjectRelation.session_id) == session_id,
+                    col(ChatUIProject.creator) == creator,
+                ),
+            )
+            return result.scalar_one_or_none()

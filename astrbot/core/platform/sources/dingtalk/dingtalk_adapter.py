@@ -2,6 +2,7 @@ import asyncio
 import os
 import threading
 import uuid
+from typing import cast
 
 import aiohttp
 import dingtalk_stream
@@ -38,7 +39,7 @@ class MyEventHandler(dingtalk_stream.EventHandler):
 
 
 @register_platform_adapter(
-    "dingtalk", "钉钉机器人官方 API 适配器", support_streaming_message=False
+    "dingtalk", "钉钉机器人官方 API 适配器", support_streaming_message=True
 )
 class DingtalkPlatformAdapter(Platform):
     def __init__(
@@ -47,21 +48,19 @@ class DingtalkPlatformAdapter(Platform):
         platform_settings: dict,
         event_queue: asyncio.Queue,
     ) -> None:
-        super().__init__(event_queue)
-
-        self.config = platform_config
-
-        self.unique_session = platform_settings["unique_session"]
+        super().__init__(platform_config, event_queue)
 
         self.client_id = platform_config["client_id"]
         self.client_secret = platform_config["client_secret"]
 
+        outer_self = self
+
         class AstrCallbackClient(dingtalk_stream.ChatbotHandler):
-            async def process(self_, message: dingtalk_stream.CallbackMessage):
+            async def process(self, message: dingtalk_stream.CallbackMessage):
                 logger.debug(f"dingtalk: {message.data}")
                 im = dingtalk_stream.ChatbotMessage.from_dict(message.data)
-                abm = await self.convert_msg(im)
-                await self.handle_msg(abm)
+                abm = await outer_self.convert_msg(im)
+                await outer_self.handle_msg(abm)
 
                 return AckMessage.STATUS_OK, "OK"
 
@@ -75,14 +74,17 @@ class DingtalkPlatformAdapter(Platform):
             self.client,
         )
         self.client_ = client  # 用于 websockets 的 client
+        self._shutdown_event: threading.Event | None = None
+        self.card_template_id = platform_config.get("card_template_id")
+        self.card_instance_id_dict = {}
 
-    def _id_to_sid(self, dingtalk_id: str | None) -> str | None:
+    def _id_to_sid(self, dingtalk_id: str | None) -> str:
         if not dingtalk_id:
-            return dingtalk_id
+            return dingtalk_id or "unknown"
         prefix = "$:LWCP_v1:$"
         if dingtalk_id.startswith(prefix):
             return dingtalk_id[len(prefix) :]
-        return dingtalk_id
+        return dingtalk_id or "unknown"
 
     async def send_by_session(
         self,
@@ -95,9 +97,65 @@ class DingtalkPlatformAdapter(Platform):
         return PlatformMetadata(
             name="dingtalk",
             description="钉钉机器人官方 API 适配器",
-            id=self.config.get("id"),
-            support_streaming_message=False,
+            id=cast(str, self.config.get("id")),
+            support_streaming_message=True,
         )
+
+    async def create_message_card(
+        self, message_id: str, incoming_message: dingtalk_stream.ChatbotMessage
+    ):
+        if not self.card_template_id:
+            return False
+
+        card_instance = dingtalk_stream.AICardReplier(self.client_, incoming_message)
+        card_data = {"content": ""}  # Initial content empty
+
+        try:
+            card_instance_id = await card_instance.async_create_and_deliver_card(
+                self.card_template_id,
+                card_data,
+            )
+            self.card_instance_id_dict[message_id] = (card_instance, card_instance_id)
+            return True
+        except Exception as e:
+            logger.error(f"创建钉钉卡片失败: {e}")
+            return False
+
+    async def send_card_message(self, message_id: str, content: str, is_final: bool):
+        if message_id not in self.card_instance_id_dict:
+            return
+
+        card_instance, card_instance_id = self.card_instance_id_dict[message_id]
+        content_key = "content"
+
+        try:
+            # 钉钉卡片流式更新
+
+            await card_instance.async_streaming(
+                card_instance_id,
+                content_key=content_key,
+                content_value=content,
+                append=False,
+                finished=is_final,
+                failed=False,
+            )
+        except Exception as e:
+            logger.error(f"发送钉钉卡片消息失败: {e}")
+            # Try to report failure
+            try:
+                await card_instance.async_streaming(
+                    card_instance_id,
+                    content_key=content_key,
+                    content_value=content,  # Keep existing content
+                    append=False,
+                    finished=True,
+                    failed=True,
+                )
+            except Exception:
+                pass
+
+        if is_final:
+            self.card_instance_id_dict.pop(message_id, None)
 
     async def convert_msg(
         self,
@@ -106,7 +164,7 @@ class DingtalkPlatformAdapter(Platform):
         abm = AstrBotMessage()
         abm.message = []
         abm.message_str = ""
-        abm.timestamp = int(message.create_at / 1000)
+        abm.timestamp = int(cast(int, message.create_at) / 1000)
         abm.type = (
             MessageType.GROUP_MESSAGE
             if message.conversation_type == "2"
@@ -117,7 +175,7 @@ class DingtalkPlatformAdapter(Platform):
             nickname=message.sender_nick,
         )
         abm.self_id = self._id_to_sid(message.chatbot_user_id)
-        abm.message_id = message.message_id
+        abm.message_id = cast(str, message.message_id)
         abm.raw_message = message
 
         if abm.type == MessageType.GROUP_MESSAGE:
@@ -127,21 +185,20 @@ class DingtalkPlatformAdapter(Platform):
                     if id := self._id_to_sid(user.dingtalk_id):
                         abm.message.append(At(qq=id))
             abm.group_id = message.conversation_id
-            if self.unique_session:
-                abm.session_id = abm.sender.user_id
-            else:
-                abm.session_id = abm.group_id
+            abm.session_id = abm.group_id
         else:
             abm.session_id = abm.sender.user_id
 
-        message_type: str = message.message_type
+        message_type: str = cast(str, message.message_type)
         match message_type:
             case "text":
                 abm.message_str = message.text.content.strip()
                 abm.message.append(Plain(abm.message_str))
             case "richText":
-                rtc: dingtalk_stream.RichTextContent = message.rich_text_content
-                contents: list[dict] = rtc.rich_text_list
+                rtc: dingtalk_stream.RichTextContent = cast(
+                    dingtalk_stream.RichTextContent, message.rich_text_content
+                )
+                contents: list[dict] = cast(list[dict], rtc.rich_text_list)
                 for content in contents:
                     plains = ""
                     if "text" in content:
@@ -150,7 +207,7 @@ class DingtalkPlatformAdapter(Platform):
                     elif "type" in content and content["type"] == "picture":
                         f_path = await self.download_ding_file(
                             content["downloadCode"],
-                            message.robot_code,
+                            cast(str, message.robot_code),
                             "jpg",
                         )
                         abm.message.append(Image.fromFileSystem(f_path))
@@ -195,7 +252,7 @@ class DingtalkPlatformAdapter(Platform):
                 logger.error(
                     f"下载钉钉文件失败: {resp.status}, {await resp.text()}",
                 )
-                return None
+                return ""
             resp_data = await resp.json()
             download_url = resp_data["data"]["downloadUrl"]
             await download_file(download_url, f_path)
@@ -215,7 +272,7 @@ class DingtalkPlatformAdapter(Platform):
                     logger.error(
                         f"获取钉钉机器人 access_token 失败: {resp.status}, {await resp.text()}",
                     )
-                    return None
+                    return ""
                 return (await resp.json())["data"]["accessToken"]
 
     async def handle_msg(self, abm: AstrBotMessage):
@@ -225,6 +282,7 @@ class DingtalkPlatformAdapter(Platform):
             platform_meta=self.meta(),
             session_id=abm.session_id,
             client=self.client,
+            adapter=self,
         )
 
         self._event_queue.put_nowait(event)
@@ -241,7 +299,7 @@ class DingtalkPlatformAdapter(Platform):
                     task.result()
             except Exception as e:
                 if "Graceful shutdown" in str(e):
-                    logger.info("钉钉适配器已被优雅地关闭")
+                    logger.info("钉钉适配器已被关闭")
                     return
                 logger.error(f"钉钉机器人启动失败: {e}")
 
@@ -250,11 +308,13 @@ class DingtalkPlatformAdapter(Platform):
 
     async def terminate(self):
         def monkey_patch_close():
-            raise Exception("Graceful shutdown")
+            raise KeyboardInterrupt("Graceful shutdown")
 
-        self.client_.open_connection = monkey_patch_close
-        await self.client_.websocket.close(code=1000, reason="Graceful shutdown")
-        self._shutdown_event.set()
+        if self.client_.websocket is not None:
+            self.client_.open_connection = monkey_patch_close
+            await self.client_.websocket.close(code=1000, reason="Graceful shutdown")
+        if self._shutdown_event is not None:
+            self._shutdown_event.set()
 
     def get_client(self):
         return self.client

@@ -3,13 +3,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TypedDict
 
-from sqlmodel import (
-    JSON,
-    Field,
-    SQLModel,
-    Text,
-    UniqueConstraint,
-)
+from sqlmodel import JSON, Field, SQLModel, Text, UniqueConstraint
 
 
 class PlatformStat(SQLModel, table=True):
@@ -18,7 +12,7 @@ class PlatformStat(SQLModel, table=True):
     Note: In astrbot v4, we moved `platform` table to here.
     """
 
-    __tablename__ = "platform_stats"
+    __tablename__: str = "platform_stats"
 
     id: int = Field(primary_key=True, sa_column_kwargs={"autoincrement": True})
     timestamp: datetime = Field(nullable=False)
@@ -37,9 +31,10 @@ class PlatformStat(SQLModel, table=True):
 
 
 class ConversationV2(SQLModel, table=True):
-    __tablename__ = "conversations"
+    __tablename__: str = "conversations"
 
-    inner_conversation_id: int = Field(
+    inner_conversation_id: int | None = Field(
+        default=None,
         primary_key=True,
         sa_column_kwargs={"autoincrement": True},
     )
@@ -59,11 +54,54 @@ class ConversationV2(SQLModel, table=True):
     )
     title: str | None = Field(default=None, max_length=255)
     persona_id: str | None = Field(default=None)
+    token_usage: int = Field(default=0, nullable=False)
+    """content is a list of OpenAI-formated messages in list[dict] format.
+    token_usage is the total token value of the messages.
+    when 0, will use estimated token counter.
+    """
 
     __table_args__ = (
         UniqueConstraint(
             "conversation_id",
             name="uix_conversation_id",
+        ),
+    )
+
+
+class PersonaFolder(SQLModel, table=True):
+    """Persona 文件夹，支持递归层级结构。
+
+    用于组织和管理多个 Persona，类似于文件系统的目录结构。
+    """
+
+    __tablename__: str = "persona_folders"
+
+    id: int | None = Field(
+        primary_key=True,
+        sa_column_kwargs={"autoincrement": True},
+        default=None,
+    )
+    folder_id: str = Field(
+        max_length=36,
+        nullable=False,
+        unique=True,
+        default_factory=lambda: str(uuid.uuid4()),
+    )
+    name: str = Field(max_length=255, nullable=False)
+    parent_id: str | None = Field(default=None, max_length=36)
+    """父文件夹ID，NULL表示根目录"""
+    description: str | None = Field(default=None, sa_type=Text)
+    sort_order: int = Field(default=0)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column_kwargs={"onupdate": datetime.now(timezone.utc)},
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "folder_id",
+            name="uix_persona_folder_id",
         ),
     )
 
@@ -74,7 +112,7 @@ class Persona(SQLModel, table=True):
     It can be used to customize the behavior of LLMs.
     """
 
-    __tablename__ = "personas"
+    __tablename__: str = "personas"
 
     id: int | None = Field(
         primary_key=True,
@@ -87,6 +125,10 @@ class Persona(SQLModel, table=True):
     """a list of strings, each representing a dialog to start with"""
     tools: list | None = Field(default=None, sa_type=JSON)
     """None means use ALL tools for default, empty list means no tools, otherwise a list of tool names."""
+    folder_id: str | None = Field(default=None, max_length=36)
+    """所属文件夹ID，NULL 表示在根目录"""
+    sort_order: int = Field(default=0)
+    """排序顺序"""
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
@@ -104,7 +146,7 @@ class Persona(SQLModel, table=True):
 class Preference(SQLModel, table=True):
     """This class represents preferences for bots."""
 
-    __tablename__ = "preferences"
+    __tablename__: str = "preferences"
 
     id: int | None = Field(
         default=None,
@@ -140,7 +182,7 @@ class PlatformMessageHistory(SQLModel, table=True):
     or platform-specific messages.
     """
 
-    __tablename__ = "platform_message_history"
+    __tablename__: str = "platform_message_history"
 
     id: int | None = Field(
         primary_key=True,
@@ -161,13 +203,55 @@ class PlatformMessageHistory(SQLModel, table=True):
     )
 
 
+class PlatformSession(SQLModel, table=True):
+    """Platform session table for managing user sessions across different platforms.
+
+    A session represents a chat window for a specific user on a specific platform.
+    Each session can have multiple conversations (对话) associated with it.
+    """
+
+    __tablename__: str = "platform_sessions"
+
+    inner_id: int | None = Field(
+        primary_key=True,
+        sa_column_kwargs={"autoincrement": True},
+        default=None,
+    )
+    session_id: str = Field(
+        max_length=100,
+        nullable=False,
+        unique=True,
+        default_factory=lambda: str(uuid.uuid4()),
+    )
+    platform_id: str = Field(default="webchat", nullable=False)
+    """Platform identifier (e.g., 'webchat', 'qq', 'discord')"""
+    creator: str = Field(nullable=False)
+    """Username of the session creator"""
+    display_name: str | None = Field(default=None, max_length=255)
+    """Display name for the session"""
+    is_group: int = Field(default=0, nullable=False)
+    """0 for private chat, 1 for group chat (not implemented yet)"""
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column_kwargs={"onupdate": datetime.now(timezone.utc)},
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            name="uix_platform_session_id",
+        ),
+    )
+
+
 class Attachment(SQLModel, table=True):
     """This class represents attachments for messages in AstrBot.
 
     Attachments can be images, files, or other media types.
     """
 
-    __tablename__ = "attachments"
+    __tablename__: str = "attachments"
 
     inner_attachment_id: int | None = Field(
         primary_key=True,
@@ -197,6 +281,130 @@ class Attachment(SQLModel, table=True):
     )
 
 
+class ChatUIProject(SQLModel, table=True):
+    """This class represents projects for organizing ChatUI conversations.
+
+    Projects allow users to group related conversations together.
+    """
+
+    __tablename__: str = "chatui_projects"
+
+    inner_id: int | None = Field(
+        primary_key=True,
+        sa_column_kwargs={"autoincrement": True},
+        default=None,
+    )
+    project_id: str = Field(
+        max_length=36,
+        nullable=False,
+        unique=True,
+        default_factory=lambda: str(uuid.uuid4()),
+    )
+    creator: str = Field(nullable=False)
+    """Username of the project creator"""
+    emoji: str | None = Field(default="📁", max_length=10)
+    """Emoji icon for the project"""
+    title: str = Field(nullable=False, max_length=255)
+    """Title of the project"""
+    description: str | None = Field(default=None, max_length=1000)
+    """Description of the project"""
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column_kwargs={"onupdate": datetime.now(timezone.utc)},
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            name="uix_chatui_project_id",
+        ),
+    )
+
+
+class SessionProjectRelation(SQLModel, table=True):
+    """This class represents the relationship between platform sessions and ChatUI projects."""
+
+    __tablename__: str = "session_project_relations"
+
+    id: int | None = Field(
+        primary_key=True,
+        sa_column_kwargs={"autoincrement": True},
+        default=None,
+    )
+    session_id: str = Field(nullable=False, max_length=100)
+    """Session ID from PlatformSession"""
+    project_id: str = Field(nullable=False, max_length=36)
+    """Project ID from ChatUIProject"""
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            name="uix_session_project_relation",
+        ),
+    )
+
+
+class CommandConfig(SQLModel, table=True):
+    """Per-command configuration overrides for dashboard management."""
+
+    __tablename__ = "command_configs"  # type: ignore
+
+    handler_full_name: str = Field(
+        primary_key=True,
+        max_length=512,
+    )
+    plugin_name: str = Field(nullable=False, max_length=255)
+    module_path: str = Field(nullable=False, max_length=255)
+    original_command: str = Field(nullable=False, max_length=255)
+    resolved_command: str | None = Field(default=None, max_length=255)
+    enabled: bool = Field(default=True, nullable=False)
+    keep_original_alias: bool = Field(default=False, nullable=False)
+    conflict_key: str | None = Field(default=None, max_length=255)
+    resolution_strategy: str | None = Field(default=None, max_length=64)
+    note: str | None = Field(default=None, sa_type=Text)
+    extra_data: dict | None = Field(default=None, sa_type=JSON)
+    auto_managed: bool = Field(default=False, nullable=False)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column_kwargs={"onupdate": datetime.now(timezone.utc)},
+    )
+
+
+class CommandConflict(SQLModel, table=True):
+    """Conflict tracking for duplicated command names."""
+
+    __tablename__ = "command_conflicts"  # type: ignore
+
+    id: int | None = Field(
+        default=None, primary_key=True, sa_column_kwargs={"autoincrement": True}
+    )
+    conflict_key: str = Field(nullable=False, max_length=255)
+    handler_full_name: str = Field(nullable=False, max_length=512)
+    plugin_name: str = Field(nullable=False, max_length=255)
+    status: str = Field(default="pending", max_length=32)
+    resolution: str | None = Field(default=None, max_length=64)
+    resolved_command: str | None = Field(default=None, max_length=255)
+    note: str | None = Field(default=None, sa_type=Text)
+    extra_data: dict | None = Field(default=None, sa_type=JSON)
+    auto_generated: bool = Field(default=False, nullable=False)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column_kwargs={"onupdate": datetime.now(timezone.utc)},
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "conflict_key",
+            "handler_full_name",
+            name="uix_conflict_handler",
+        ),
+    )
+
+
 @dataclass
 class Conversation:
     """LLM 对话类
@@ -217,6 +425,8 @@ class Conversation:
     persona_id: str | None = ""
     created_at: int = 0
     updated_at: int = 0
+    token_usage: int = 0
+    """对话的总 token 数量。AstrBot 会保留最近一次 LLM 请求返回的总 token 数，方便统计。token_usage 可能为 0，表示未知。"""
 
 
 class Personality(TypedDict):
@@ -225,17 +435,17 @@ class Personality(TypedDict):
     在 v4.0.0 版本及之后，推荐使用上面的 Persona 类。并且， mood_imitation_dialogs 字段已被废弃。
     """
 
-    prompt: str = ""
-    name: str = ""
-    begin_dialogs: list[str] = []
-    mood_imitation_dialogs: list[str] = []
+    prompt: str
+    name: str
+    begin_dialogs: list[str]
+    mood_imitation_dialogs: list[str]
     """情感模拟对话预设。在 v4.0.0 版本及之后，已被废弃。"""
-    tools: list[str] | None = None
+    tools: list[str] | None
     """工具列表。None 表示使用所有工具，空列表表示不使用任何工具"""
 
     # cache
-    _begin_dialogs_processed: list[dict] = []
-    _mood_imitation_dialogs_processed: str = ""
+    _begin_dialogs_processed: list[dict]
+    _mood_imitation_dialogs_processed: str
 
 
 # ====

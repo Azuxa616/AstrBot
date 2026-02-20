@@ -1,8 +1,10 @@
 import abc
 import asyncio
+import os
 from collections.abc import AsyncGenerator
+from typing import TypeAlias, Union
 
-from astrbot.core.agent.message import Message
+from astrbot.core.agent.message import ContentPart, Message
 from astrbot.core.agent.tool import ToolSet
 from astrbot.core.provider.entities import (
     LLMResponse,
@@ -11,6 +13,15 @@ from astrbot.core.provider.entities import (
     ToolCallsResult,
 )
 from astrbot.core.provider.register import provider_cls_map
+from astrbot.core.utils.astrbot_path import get_astrbot_path
+
+Providers: TypeAlias = Union[
+    "Provider",
+    "STTProvider",
+    "TTSProvider",
+    "EmbeddingProvider",
+    "RerankProvider",
+]
 
 
 class AbstractProvider(abc.ABC):
@@ -42,6 +53,14 @@ class AbstractProvider(abc.ABC):
             provider_type=meta_data.provider_type,
         )
         return meta
+
+    async def test(self):
+        """test the provider is a
+
+        raises:
+            Exception: if the provider is not available
+        """
+        ...
 
 
 class Provider(AbstractProvider):
@@ -84,6 +103,7 @@ class Provider(AbstractProvider):
         system_prompt: str | None = None,
         tool_calls_result: ToolCallsResult | list[ToolCallsResult] | None = None,
         model: str | None = None,
+        extra_user_content_parts: list[ContentPart] | None = None,
         **kwargs,
     ) -> LLMResponse:
         """获得 LLM 的文本对话结果。会使用当前的模型进行对话。
@@ -95,6 +115,7 @@ class Provider(AbstractProvider):
             tools: tool set
             contexts: 上下文，和 prompt 二选一使用
             tool_calls_result: 回传给 LLM 的工具调用结果。参考: https://platform.openai.com/docs/guides/function-calling
+            extra_user_content_parts: 额外的内容块列表，用于在用户消息后添加额外的文本块（如系统提醒、指令等）
             kwargs: 其他参数
 
         Notes:
@@ -132,7 +153,9 @@ class Provider(AbstractProvider):
             - 如果传入了 tools，将会使用 tools 进行 Function-calling。如果模型不支持 Function-calling，将会抛出错误。
 
         """
-        ...
+        if False:  # pragma: no cover - make this an async generator for typing
+            yield None  # type: ignore
+        raise NotImplementedError()
 
     async def pop_record(self, context: list):
         """弹出 context 第一条非系统提示词对话记录"""
@@ -165,6 +188,12 @@ class Provider(AbstractProvider):
 
         return dicts
 
+    async def test(self, timeout: float = 45.0):
+        await asyncio.wait_for(
+            self.text_chat(prompt="REPLY `PONG` ONLY"),
+            timeout=timeout,
+        )
+
 
 class STTProvider(AbstractProvider):
     def __init__(self, provider_config: dict, provider_settings: dict) -> None:
@@ -177,6 +206,14 @@ class STTProvider(AbstractProvider):
         """获取音频的文本"""
         raise NotImplementedError
 
+    async def test(self):
+        sample_audio_path = os.path.join(
+            get_astrbot_path(),
+            "samples",
+            "stt_health_check.wav",
+        )
+        await self.get_text(sample_audio_path)
+
 
 class TTSProvider(AbstractProvider):
     def __init__(self, provider_config: dict, provider_settings: dict) -> None:
@@ -184,10 +221,67 @@ class TTSProvider(AbstractProvider):
         self.provider_config = provider_config
         self.provider_settings = provider_settings
 
+    def support_stream(self) -> bool:
+        """是否支持流式 TTS
+
+        Returns:
+            bool: True 表示支持流式处理，False 表示不支持（默认）
+
+        Notes:
+            子类可以重写此方法返回 True 来启用流式 TTS 支持
+        """
+        return False
+
     @abc.abstractmethod
     async def get_audio(self, text: str) -> str:
         """获取文本的音频，返回音频文件路径"""
         raise NotImplementedError
+
+    async def get_audio_stream(
+        self,
+        text_queue: asyncio.Queue[str | None],
+        audio_queue: "asyncio.Queue[bytes | tuple[str, bytes] | None]",
+    ) -> None:
+        """流式 TTS 处理方法。
+
+        从 text_queue 中读取文本片段，将生成的音频数据（WAV 格式的 in-memory bytes）放入 audio_queue。
+        当 text_queue 收到 None 时，表示文本输入结束，此时应该处理完所有剩余文本并向 audio_queue 发送 None 表示结束。
+
+        Args:
+            text_queue: 输入文本队列，None 表示输入结束
+            audio_queue: 输出音频队列（bytes 或 (text, bytes)），None 表示输出结束
+
+        Notes:
+            - 默认实现会将文本累积后一次性调用 get_audio 生成完整音频
+            - 子类可以重写此方法实现真正的流式 TTS
+            - 音频数据应该是 WAV 格式的 bytes
+        """
+        accumulated_text = ""
+
+        while True:
+            text_part = await text_queue.get()
+
+            if text_part is None:
+                # 输入结束，处理累积的文本
+                if accumulated_text:
+                    try:
+                        # 调用原有的 get_audio 方法获取音频文件路径
+                        audio_path = await self.get_audio(accumulated_text)
+                        # 读取音频文件内容
+                        with open(audio_path, "rb") as f:
+                            audio_data = f.read()
+                        await audio_queue.put((accumulated_text, audio_data))
+                    except Exception:
+                        # 出错时也要发送 None 结束标记
+                        pass
+                # 发送结束标记
+                await audio_queue.put(None)
+                break
+
+            accumulated_text += text_part
+
+    async def test(self):
+        await self.get_audio("hi")
 
 
 class EmbeddingProvider(AbstractProvider):
@@ -210,6 +304,9 @@ class EmbeddingProvider(AbstractProvider):
     def get_dim(self) -> int:
         """获取向量的维度"""
         ...
+
+    async def test(self):
+        await self.get_embedding("astrbot")
 
     async def get_embeddings_batch(
         self,
@@ -294,3 +391,8 @@ class RerankProvider(AbstractProvider):
     ) -> list[RerankResult]:
         """获取查询和文档的重排序分数"""
         ...
+
+    async def test(self):
+        result = await self.rerank("Apple", documents=["apple", "banana"])
+        if not result:
+            raise Exception("Rerank provider test failed, no results returned")
